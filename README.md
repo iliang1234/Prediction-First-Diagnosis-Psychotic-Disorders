@@ -32,6 +32,8 @@ Directory containing model evaluation results and analysis outputs at MGH
 
 - R (recommended version >= 4.0)
 - RStudio (for working with .Rmd files)
+- Python version >= 3.0 (analysis code ran with Python 3.6.15)
+- Jupyter Notebook (for working with the analysis notebooks)
 
 ### Workflow
 
