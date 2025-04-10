@@ -1,0 +1,561 @@
+---
+title: "Psychosis - Prepare for Analysis"
+output:
+  html_document: default
+  pdf_document: default
+date: '2022-07-19'
+author: 'Yuval Barak-Corren'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/ch170655/Documents/Psychosis/Data/")
+setwd("C:/Users/ch170655/Documents/Psychosis/Data/")
+
+```
+
+## Define Global Functions
+```{r define_functions, echo=FALSE, warning=FALSE}
+showCountandRate <- function(m,n,n_digits=1){ return(paste(m,' (',round(100 * m / n, digits = n_digits),'%)',sep='')) }
+
+getSummaryStatsTbl <- function(roc.res){
+  res = data.frame()
+  for(spec in c(0.8,0.9,0.95,0.99)){
+    res = rbind(res, round(coords(roc.res, x = spec, input = 'specificity', ret = c('spec','sen','ppv','npv', 'tp','fp','tn','fn'), transpose = F), digits = 2))
+  }
+  res$AUC = round(roc.res$auc, digits = 2)
+  for(col in c('tp','fp','tn','fn')) res[,col] <- round(res[,col], digits = 0)
+  return(res)
+}
+
+
+prepareModelDataUsingORCutoff <- function(df, odds_ratios, cutoff_lower = 0.01, cutoff_upper = 1.5, min_cases = 5){
+  all_ids = unique(df$PATIENT_ID)
+  selected_concepts = odds_ratios$concept_code[(odds_ratios$cases > min_cases) & (odds_ratios$OR < cutoff_lower | odds_ratios$OR >= cutoff_upper)]
+  df$concept_type_code = paste(df$concept_type, df$concept_code,sep='_')
+  df = df[df$concept_type_code %in% selected_concepts, ]
+  df = rbind(df, data.frame(PATIENT_ID = all_ids, date = NA, age = NA, concept_type = 'stub', concept_code = 'stub', isCase = NA, time_till_index = NA, concept_type_code = 'stub_stub'))  
+  # make sure we include all subjects (use a 'stub' concept code for that)
+  tbl = as.data.frame.matrix(table(df$PATIENT_ID, df$concept_type_code))
+  return(tbl)
+}
+
+
+addMissingLabel <- function(a, missing_label){
+  a = as.character(a)
+  a[is.na(a)] <- missing_label
+  a = factor(a)
+  return(a)
+}
+
+reduceLevels <- function(a, n_levels = 50){
+  s = summary(a, n_levels)
+  a = as.character(a)
+  a[!(a %in% names(s))] <- 'Other'
+  a = factor(a)
+  return(a)
+}
+
+readAllDatasetSegments <- function(path_name){
+  all_files = list.files(path_name, pattern = '*.csv', full.names = T)
+  res = data.frame()
+  count = 1
+  for(fn in all_files){
+    print(paste('Reading file',count,'/',length(all_files)))
+    df = read.delim(fn, sep = '\t'); print(paste('number of rows =', nrow(df)))
+    res = rbind(res, df)
+    count = count + 1
+  } 
+  return(res)
+}
+
+
+```
+
+## Prepare case definition dataset
+```{r prepare_case_def, echo = FALSE}
+demographics_all <- readRDS('demographics.included.RDs')
+
+
+# load cases --------------------------------
+
+SELECTED_OUTCOME = 'broad' # there are 3 possible case-definitions: broad, narroaw, and hybrid. We use 'broad' for now
+cases = readRDS(paste('cases_noExclusions_',SELECTED_OUTCOME,'.RDs',sep='')) # load the cases dataset with the selected definition
+# There are 3 exclusion criteria for patients who met the FEP case definition:
+# 1. At least 1 encounter in the 10 years before index FEP code
+# 2. index code must occur on or after year 2000
+# 3. At least 2 encounters greater than 2yrs prior to index FEP code
+
+# we currently use only criteria 1 & 2 at Children's as we will loose too many patients otherwise. 
+# The name of the variable for condition 3 is 'inclusion1_moreThanTwoYears'
+cases = cases[cases$inclusion2_visitInLast10Years == T & cases$inclusion3_indexAfterYear2000 == T, ]
+
+# mark the index date as the date in which the patient first met the FEP case definition (by default use Table-1, if not available then Table-2)
+cases$index_date = cases$table1_start
+idxs = which(!is.na(cases$table2_start) & (cases$index_date > cases$table2_start))
+if(length(idxs) > 0) cases$index_date[idxs] <- cases$table2_start[idxs]
+
+# extract the age of the patient at the index event
+cases$index_age = round(as.numeric(difftime(cases$index_date, cases$birth_date, units = 'days')) / 365, digits = 1)
+saveRDS(cases, 'cases.RDs') # cases = readRDS('cases.RDs')
+
+# load controls --------------------------------
+
+# There are 2 options for a control group: either patients meeting the controls case-def ('CONTROLS') or all patients who are not cases ('NON_CASES)
+CONTROLS_TYPE = 'CONTROLS' #  NON_CASES
+
+# 1) all non-cases
+if (CONTROLS_TYPE == 'NON_CASES'){ 
+  controls <- demographics_all[!(demographics_all$PATIENT_ID %in% cases$PATIENT_ID), ]
+} else 
+# 2) all controls who meet controls-criteria
+{ 
+  controls = readRDS('controls.RDs') 
+}
+
+# for controls also add a surrogate for an 'index event' which is the last documented information they have
+# add 'time till index' for controls as well - this will be the time till last follow-up
+# (this can be done only after the controls_last_timestamp is generated, later in code)
+
+# get last visit from 'encounters' dataset
+encounters = readRDS('encounters.included.RDs') # derived from diagnosis dataset
+controls_last_timestamp = encounters[order(encounters$PATIENT_ID, encounters$START_DATE), ]
+controls_last_timestamp = controls_last_timestamp[rev(!duplicated(rev(controls_last_timestamp$PATIENT_ID))), ]
+
+controls$index_date = controls_last_timestamp$START_DATE[match(controls$PATIENT_ID, controls_last_timestamp$PATIENT_ID)]
+controls$index_age = round(as.numeric(difftime(controls$index_date, controls$BIRTH_DATE, units = 'days')) / 365, digits = 1)
+
+
+saveRDS(controls, paste('controls_',CONTROLS_TYPE,'.RDs',sep='')) # controls = readRDS('./controls_ CONTROLS .RDs')
+
+# down-sample the controls for computational purposes
+controls_ids_sample = sample(controls$PATIENT_ID, nrow(cases)*4, replace = F)
+
+saveRDS(controls[controls$PATIENT_ID %in% controls_ids_sample, ], paste('controls_',CONTROLS_TYPE,'_sample.RDs',sep=''))
+```
+
+
+## Load Files
+```{r load_data, echo = FALSE}
+setwd('C:/Users/ch170655/Documents/Psychosis/Data')
+# load case definitions
+cases = readRDS('cases.RDs')
+cases_ids = cases$PATIENT_ID
+controls = readRDS('controls_ CONTROLS .RDs')
+controls_ids = controls$PATIENT_ID
+
+controls.sample = readRDS('controls_CONTROLS_sample.RDs')
+controls.sample_ids = controls.sample$PATIENT_ID
+
+# subjects included in study = cases + controls
+included_ids = c(cases_ids, controls_ids)
+included_ids.sample = c(cases_ids, controls.sample_ids)
+
+
+# load all data available for modeling
+demographics_all <- readRDS('demographics.included.RDs')
+diagnosis = readRDS('diagnosis.included.RDs')
+meds = readRDS('meds.RDs') 
+encounters = readRDS('encounters.included.RDs') # derived from diagnosis dataset
+labs = readRDS('labs.RDs')  
+procs = readRDS('procs.RDs')  
+insurance = readRDS('insurance.RDs')
+
+# leave only information for included patients
+demographics <- demographics_all[demographics_all$PATIENT_ID %in% included_ids, ]
+diagnosis <- diagnosis[diagnosis$PATIENT_ID %in% included_ids, ]
+meds <- meds[meds$PATIENT_ID %in% included_ids, ]
+encounters <- encounters[encounters$PATIENT_ID %in% included_ids, ]
+labs <- labs[labs$PATIENT_ID %in% included_ids, ]
+procs <- procs[procs$PATIENT_ID %in% included_ids, ]
+insurance <- insurance[insurance$PATIENT_ID %in% included_ids, ]
+
+# create a table including all index events
+index_events = rbind(data.frame(PATIENT_ID = cases$PATIENT_ID, index_date = cases$index_date, isCase = 1),
+                     data.frame(PATIENT_ID = controls$PATIENT_ID, index_date = controls$index_date, isCase = 0))
+index_events$birth_date = demographics$BIRTH_DATE[match(index_events$PATIENT_ID, demographics$PATIENT_ID)]
+index_events$age_at_index = round(as.numeric(difftime(index_events$index_date, index_events$birth_date, units = 'days')) / 365, digits = 1)
+saveRDS(index_events, 'index_events.RDs')
+
+index_events = readRDS('index_events.RDs')
+```
+
+## Run preliminary descriptive statistics over each dataset
+```{r descriptive_stats_of_datasets, echo = FALSE}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Encounters
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+dim(encounters) # 17886693 | PATIENT_ID, ENCOUNTER_NUM, START_DATE
+paste(colnames(encounters), collapse = ', ')
+summary(encounters$START_DATE)
+all_dates = encounters$START_DATE
+all_dates = all_dates[order(all_dates)]
+
+# plot the dates of all available encounters, cases vs. controls, between given date-range (1975-2023)
+require(ggplot2)
+start_date = strptime('1975-01-01', '%Y-%m-%d')
+end_date = strptime('2023-01-01', '%Y-%m-%d')
+ggplot(data = encounters[encounters$START_DATE > start_date & encounters$START_DATE < end_date, ], aes(x = START_DATE, fill = 'Encounters')) + 
+    geom_histogram( color="#e9ecef", alpha=0.6, position = 'identity', aes(y=..density..)) +
+    scale_fill_manual(values=c("#69b3a2", "#404080")) +
+    theme_minimal() +
+    labs(fill="")
+
+# see how many encounters will we exclude with given cut-off dates
+start_date = strptime('1985-01-01', '%Y-%m-%d')
+end_date = strptime('2022-07-31', '%Y-%m-%d')
+sum(encounters$START_DATE < start_date)
+sum(encounters$START_DATE > end_date)
+# encounters = encounters[encounters$START_DATE >= start_date & encounters$START_DATE <= end_date, ] #  17,874,169
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Diagnosis
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+dim(diagnosis) # PATIENT_ID, ENCOUNTER_NUM, START_DATE, END_DATE, DIAGNOSIS_CODE, DIAGNOSIS_NAME
+paste(colnames(diagnosis), collapse = ', ')
+dim(meds) # 215644186 | PATIENT_ID, ENCOUNTER_NUM, START_DATE, END_DATE, MED_CODE, MED_NAME
+paste(colnames(meds), collapse = ', ')
+summary(meds$START_DATE)
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Labs
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+dim(labs) # 79734456 | PATIENT_ID, ENCOUNTER_NUM, START_DATE, END_DATE, LAB_CODE, LAB_NAME, TVAL_CHAR, NVAL_NUM, UNITS_CD, VALUEFLAG_CD
+paste(colnames(labs), collapse = ', ')
+summary(labs$START_DATE)
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Procedures
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+dim(procs) # 66655894 | PATIENT_ID, ENCOUNTER_NUM, START_DATE, END_DATE, CPT_CODE, CPT_NAME
+paste(colnames(procs), collapse = ', ')
+summary(procs$START_DATE)
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Insurance
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+dim(insurance) # 31418153 | PATIENT_ID, ENCOUNTER_NUM, INSURANCE
+paste(colnames(insurance), collapse = ', ')
+summary(factor(insurance$INSURANCE))
+
+```
+
+##  Merge datasets for predictions - create model data
+```{r merge_datasets, echo = FALSE}
+
+#
+#
+# Function: getModelRawData
+# Input variables:
+#   patient_id: id of patient
+#   concept_date: date when concept was documented
+#   concept_code: the code used to describe the concept (any text format)
+#   demographics: the demographics dataset in order to extract birth date
+#   index_events: the index dates for both cases (index event) and controls (last documented code)
+#   cases_ids: the cases dataset to identify cases and also calculate time till index
+#   concept_type: the prefix to add for the concept for final model table (e.g. 'dx', 'labs', etc.)
+#
+# Output: a dataset with the following format - PATIENT_ID | date | age | concept_type | concept_code | isCase | time_till_index
+#
+getModelRawData <- function(patient_id, concept_date, concept_code, demographics, index_events, cases_ids, concept_type){
+  birth_dates = demographics$BIRTH_DATE[match(patient_id, demographics$PATIENT_ID)]
+  index_dates = index_events$index_date[match(patient_id, index_events$PATIENT_ID)]
+  time_till_index = round(as.numeric(difftime(index_dates, concept_date, units = 'days')) / 365, digits = 1)
+  age_at_concept = round(as.numeric(difftime(concept_date, birth_dates, units = 'days')) / 365, digits = 1)
+  res = data.frame(PATIENT_ID = patient_id, date = concept_date, age = age_at_concept, concept_type = concept_type, concept_code = concept_code, isCase = (patient_id %in% cases_ids), time_till_index = time_till_index)  
+  
+  return(res)
+}
+
+#
+# Convert each dataset into the same format that can be taken into the final model
+#
+# diagnosis
+diagnosis.model <- getModelRawData(diagnosis$PATIENT_ID, diagnosis$START_DATE, diagnosis$DIAGNOSIS_CODE, demographics, index_events, cases_ids, concept_type = 'dx')
+saveRDS(diagnosis.model, './model_datasets/diagnosis.model.RDs')
+# labs
+labs.model <- getModelRawData(labs$PATIENT_ID, labs$START_DATE, labs$LAB_CODE, demographics, index_events, cases_ids, concept_type = 'labs')
+saveRDS(labs.model, './model_datasets/labs.model.RDs')
+# meds
+meds.model <- getModelRawData(meds$PATIENT_ID, meds$START_DATE, meds$MED_CODE, demographics, index_events, cases_ids, concept_type = 'meds')
+saveRDS(meds.model, './model_datasets/meds.model.RDs')
+# procedures
+procs.model <- getModelRawData(procs$PATIENT_ID, procs$START_DATE, procs$CPT_CODE, demographics, index_events, cases_ids, concept_type = 'procs')
+saveRDS(procs.model, './model_datasets/procs.model.RDs')
+# encounters
+encounters$ENCOUNTER_CODE <- 'BCH';
+encounters.model <- getModelRawData(encounters$PATIENT_ID, encounters$START_DATE,encounters$ENCOUNTER_CODE, demographics, index_events, cases_ids, concept_type = 'encounters')
+saveRDS(encounters.model, './model_datasets/encounters.model.RDs')
+# insurance status
+insurance$START_DATE = encounters$START_DATE[match(insurance$ENCOUNTER_NUM, encounters$ENCOUNTER_NUM)]
+insurance.model <- getModelRawData(insurance$PATIENT_ID, insurance$START_DATE,insurance$INSURANCE, demographics, index_events, cases_ids, concept_type = 'insurance')
+saveRDS(insurance.model, './model_datasets/insurance.model.RDs')
+        
+# merge all datasets into one big dataset for later modeling                              
+model.data <- rbind(diagnosis.model, labs.model, meds.model, procs.model, encounters.model, insurance.model) # procs.model
+
+# truncate model data to include only data between 1985 & 07/2022
+start_date = strptime('1985-01-01', '%Y-%m-%d')
+end_date = strptime('2022-07-31', '%Y-%m-%d')
+model.data = model.data[!is.na(model.data$date) & model.data$date >= start_date & model.data$date <= end_date, ] #  
+
+saveRDS(model.data, './model_datasets/model.data.RDs')
+
+```
+
+## Clear all datasets to free memory
+```{r clear_memory, echo = FALSE}
+# free memory after creating model.data data frame
+rm(labs); rm(labs.model)
+rm(procs); rm(procs.model)
+rm(meds); rm(meds.model)
+rm(diagnosis); rm(diagnosis.model)
+gc()
+```
+
+## Get the cohorts for each landmark time-point (currently by age)
+```{r inclusion_exclusion}
+
+model.data = readRDS('./model_datasets/model.data.RDs')
+
+#
+# getPredictionCohort - truncates all information after prediction age and exclude patients 
+# who met the case definition prior to the time of prediction. 
+#
+# input: 
+#   model.data - the dataset prepared earlier, ready for modeling, including all data
+#   PRED_AGE - the age at which prediction is made at (landmark), everything after is truncated. 
+#              if PRED_AGE=NA then will predict using all data up to 30 days prior to index_date
+#   train_size - ratio of training/testing (default 80%/20%) - this will only be a flag in dataset
+# output: the model.data dataset just truncated after PRED_AGE and without excluded patients (also mark training/testing)
+#
+#
+getPredictionCohort <- function(model.data, PRED_AGE, index_events, train_size = 0.8)
+{
+  # use only data available prior to the time when prediction made. 
+  # If no age is given then use all data available 30-days and more prior to case definition
+  if (!is.na(PRED_AGE)){
+    pred.data = model.data[model.data$age < PRED_AGE, ]   
+  } else {
+    pred.data = model.data[is.na(model.data$time_till_index) | (!is.na(model.data$time_till_index) & model.data$time_till_index >= 0.1), ] 
+  }
+  
+  all_possible_ids = unique(pred.data$PATIENT_ID)
+  
+  # Exclude patients who met the case definition prior to the prediction time (for cases) or lack follow-up data (controls)
+  pred.data$age_at_index = index_events$age_at_index[match(pred.data$PATIENT_ID, index_events$PATIENT_ID)]
+  if (!is.na(PRED_AGE)){
+    excluded_ids1 = unique(pred.data$PATIENT_ID[is.na(pred.data$age_at_index) | (pred.data$age_at_index < PRED_AGE)])
+  } else {
+    excluded_ids1 = c()
+  }
+  
+  
+  # remove all information collected after the index event
+  excluded_ids2 = unique(pred.data$PATIENT_ID[!is.na(pred.data$time_till_index) & (pred.data$time_till_index < 0)])
+  
+  # Exclude patients with insufficient follow-up (basically applies only for controls. If not defined than without follow-up till age 35)
+  excluded_ids3 = c() # we remove this condition for now as we use survival analysis
+  
+  # Generate model-date using all data available up to the time of prediction
+  pred.data <- pred.data[!(pred.data$PATIENT_ID %in% unique(c(excluded_ids1, excluded_ids2, excluded_ids3))), ]  
+  
+  training_ids = sample(unique(pred.data$PATIENT_ID), floor(train_size * sum(!duplicated(pred.data$PATIENT_ID))), replace = F)
+  pred.data$isTraining = (pred.data$PATIENT_ID %in% training_ids)
+  # Identify cases that meet the case definition within the selected time-window for prediction
+  # (this was also removed as we work with survival analysis)
+  
+  return(pred.data)
+}
+
+# for each landmark time (ages 15,20,25,30) create the relevant model.data dataset
+for (PRED_AGE in c(15,20,25,30)){
+  print(paste('PRED_AGE',PRED_AGE, sep = '='))
+  pred.data = getPredictionCohort(model.data, PRED_AGE, index_events)
+  saveRDS(pred.data, paste('pred.data.age_',PRED_AGE,'.RDs',sep=''))
+}
+
+
+```
+
+
+## Convert Raw data (long) into Model-Ready (flat/wide) Datasets
+
+```{r prepare_data_for_modelling}
+
+#
+# genORTable - create a table of odds-ratio to outcome for each concept code
+# input: 
+#   concept_code: the independent risk factors (taken from model.data dataset)
+#   case_def: binary flag (True/False) indicating if the code is taken from case (True) or control (False)
+#   min_count: the minimum number of times each concept needs to appear in order to be included in final table
+# output: a table with the odds ratio for each concept, including the following columns: 
+#   concept_code, cases (cases count), controls (controls count), total count (cases+controls), OR (odds-ratio)
+#   * the dataset is ordered from highest to lowest OR
+#
+genORTable <- function(concept_code, case_def, min_count = 20){
+  
+  total_cases = sum(case_def); total_controls = sum(!case_def)
+  concept_code.cases = tapply(case_def, concept_code, sum)
+  concept_code.controls = tapply(!case_def, concept_code, sum)
+  
+  res = data.frame(concept_code = names(concept_code.cases), cases = concept_code.cases, controls = concept_code.controls)
+  res$total_count = res$cases + res$controls
+  res <- res[res$total_count > min_count, ]
+  
+  res$OR <- round((res$cases / (total_cases - res$cases)) / (res$controls / (total_controls - res$controls)), digits = 1)
+  res <- res[order(res$OR, res$cases, decreasing = T), ]
+  return(res)
+}
+
+#
+# prepareModelData - Convert Raw data (long) into Model-Ready (flat/wide) Datasets
+# input:
+#   df: the model.data data-frame (after preparing for prediction time/landmark)
+#   odds_ratios: the list of odds-ratios of each feature as generated by the genORTable function
+#   num_features_to_include: the number of features to include in model (selected by odds-ratio)
+# output: a data.frame of all patients (rows) X all features (columns) - each with the number of occurrences of the code
+#
+# df = pred.data.unique; num_features_to_include = 1000
+prepareModelData <- function(df, odds_ratios, demographics, num_features_to_include = NA, min_OR = 1.5){
+  all_ids = unique(df$PATIENT_ID)
+  if (!is.na(num_features_to_include)){
+    tmp = odds_ratios[1:min(num_features_to_include, nrow(odds_ratios)), ]
+    selected_concepts = tmp$concept_code[tmp$OR > min_OR]  
+  } else {
+    selected_concepts = odds_ratios$concept_code[odds_ratios$OR > min_OR]  
+  }
+  
+  df$concept_type_code = paste(df$concept_type, df$concept_code,sep='_')
+  df = df[df$concept_type_code %in% selected_concepts, c('PATIENT_ID', 'concept_type_code')]
+
+  # to make sure that all patients appear in final table, create empty (stub) rows for patients with missing data
+  missing_ids = all_ids[!(all_ids %in% df$PATIENT_ID)]
+  df = rbind(df, data.frame(PATIENT_ID = missing_ids, concept_type_code = 'stub_stub'))
+  
+  tbl = as.data.frame.matrix(table(df$PATIENT_ID, df$concept_type_code))
+  # remove the 'stub' column
+  tbl = tbl[, -grep('stub_stub', colnames(tbl))]
+  
+  # add demographics to the model data 
+  tbl$SEX = demographics$SEX_CD[match(rownames(tbl), as.character(demographics$PATIENT_ID))]
+  tbl$MARITAL_STATUS = demographics$MARITAL_STATUS_CD[match(rownames(tbl), as.character(demographics$PATIENT_ID))]
+  tbl$ethnicity = factor(as.character(demographics$ethnicity[match(rownames(tbl), as.character(demographics$PATIENT_ID))]))
+  
+  return(tbl)
+}
+
+setwd("C:/Users/ch170655/Documents/Psychosis/Data")
+index_events = readRDS('index_events.RDs')
+
+# for each landmark time (age at prediction) convert the raw (long) format to flat/wide format
+for (PRED_AGE in c(15, 20,25,30)) {
+  print(paste('PRED_AGE',PRED_AGE, sep = '='))
+  pred.data = readRDS(paste('./pred.data.age_',PRED_AGE,'.RDs',sep=''))
+  
+  # count each concept code once for each subject
+  pred.data.unique <- pred.data[!duplicated(paste(pred.data$PATIENT_ID, pred.data$concept_code)), ]
+  
+  training_ids = unique(pred.data.unique$PATIENT_ID[pred.data.unique$isTraining])
+  
+  # Calculate the odds-ratio of each concept-code (count once for each subject), use only training-set
+  training = pred.data.unique[pred.data.unique$isTraining == TRUE, ]
+  
+  odds_ratios = genORTable(concept_code = paste(training$concept_type, training$concept_code,sep='_'), 
+                           case_def = training$isCase, 
+                           min_count = 20)
+  saveRDS(odds_ratios, paste('./odds_ratio.age_',PRED_AGE,'.RDs',sep='')) 
+  # odds_ratios = readRDS(paste('./odds_ratio.age_',PRED_AGE,'.RDs',sep=''))
+  
+  # limit the number of features in the model to include only features with relatively high OR (calculated using training set)
+  # also convert the flat long concepts dataset into a single-row-per-patient format
+  pred.data.flat = prepareModelData(pred.data.unique,odds_ratios, demographics, num_features_to_include = NA, min_OR = 0) #1.5
+
+  # add case definition  
+  pred.data.flat$isCase <- ifelse(rownames(pred.data.flat) %in% as.character(cases$PATIENT_ID), 1, 0)
+  
+  # add trainin/testing flag
+  pred.data.flat$isTraining <- ifelse(rownames(pred.data.flat) %in% as.character(training_ids), 1, 0)
+  
+  pred.data.flat$timeTillEvent = index_events$age_at_index[match(rownames(pred.data.flat), as.character(index_events$PATIENT_ID))] - PRED_AGE
+  saveRDS(pred.data.flat, paste('C:/Users/ch170655/Documents/Psychosis/Data/pred.data.flat.age_',PRED_AGE,'.RDs',sep=''))
+}
+
+```
+
+
+
+
+
+
+## code that was removed from prior analysis
+```{r removed_code, echo = FALSE}
+# getPredCohortStats <- function(pred.data, follow_up, PRED_AGE)
+# {
+#   total_included = sum(!duplicated(pred.data$PATIENT_ID))
+#   
+#   all_ages_stats = data.frame(follow_up, 
+#                               PRED_AGE, 
+#                               total_included , 
+#                               cases = showCountandRate(sum(pred.data$isCase[!duplicated(pred.data$PATIENT_ID)]), total_included), 
+#                               controls = showCountandRate(sum(!pred.data$isCase[!duplicated(pred.data$PATIENT_ID)]), total_included))
+#   return(all_ages_stats)
+# }
+# 
+# model.data = model.data[model.data$PATIENT_ID %in% included_ids, ]
+# pred.data = getPredictionCohort(model.data, NA, NA)
+# predCohortStats = getPredCohortStats(pred.data, NA, NA)
+# 
+# predCohortStats
+# saveRDS(pred.data, 'pred.data.RDs')
+
+# # Create prediction cohorts for each age & follow-up time window
+# ALL_PRED_AGES = c(1,3,5)
+# ALL_FOLLOW_UPS = c(15,20,25,30)
+# 
+# all_ages_stats = data.frame()
+# for(follow_up in ALL_PRED_AGES){
+#   for (PRED_AGE in ALL_FOLLOW_UPS){
+#     pred.data = getPredictionCohort(model.data, follow_up, PRED_AGE)
+#     all_ages_stats = rbind(all_ages_stats, getPredCohortStats(pred.data, follow_up, PRED_AGE))
+#     saveRDS(pred.data, paste('pred.data.follow_up_',follow_up,'_age_',PRED_AGE,'.RDs',sep=''))
+#   }
+# }  
+# write.csv(all_ages_stats, paste('all_ages_stats.csv') )
+
+
+
+# 
+# plot(x = 1:length(survival_cases_mean), y = survival_cases_mean, col = 'red', type  = 'b', cex = 0.5)
+# points(x = 1:length(survival_controls_mean), y = survival_controls_mean, col = 'blue', type  = 'b', cex = 0.5)
+# 
+# plot.survival(rf.fit)
+# 
+# idx1 = which(y.pred$yvar$isCase == 1)
+# idx2 = which(y.pred$yvar$isCase == 0)
+# 
+# idx1 = idx1[sample(1:length(idx1), 20, replace = F)]
+# idx2 = idx2[sample(1:length(idx2), 20, replace = F)]
+# 
+# par(cex.axis = 2.0, cex.lab = 2.0, cex.main = 2.0, mar = c(6.0,6,1,1), mgp = c(4, 1, 0))
+# 
+# plot(round(y.pred$time.interest,2),y.pred$survival[idx1[1],], type="l", xlab="Time (Year)", ylab="Survival", col=1, lty=1, lwd=2, xlim = c(0,10), ylim = c(0,1))
+# 
+# for(idx in idx1[-1]){
+#   lines(round(y.pred$time.interest,2),y.pred$survival[idx,], type="l", xlab="Time (Year)", ylab="Survival", col=1, lty=1, lwd=2, xlim = c(0,10), ylim = c(0,1))
+# }
+# 
+# for(idx in idx2){
+#   lines(round(y.pred$time.interest,2), y.pred$survival[idx,], col=2, lty=2, lwd=2)  
+# }
+# 
+# legend("topright", legend=c("Case","Control"), col=c(1:2), lty=1:2, cex=2, lwd=2)
+# 
+# rf.fit.subsample = subsample(rf.fit)
+# print(rf.fit.subsample)
+# 
+# par(oma = c(0.5, 10, 0.5, 0.5))
+# par(cex.axis = 2.0, cex.lab = 2.0, cex.main = 2.0, mar = c(6.0,17,1,1), mgp = c(4, 1, 0))
+# plot(rf.fit.subsample, xlab = "Variable Importance (x 100)", cex = 1.2)
+```

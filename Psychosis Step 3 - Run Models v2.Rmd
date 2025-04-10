@@ -1,0 +1,1193 @@
+---
+title: "Psychosis - Run Analysis"
+output:
+  html_document: default
+  pdf_document: default
+date: '2022-07-19'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = 'C:/Users/ch170655/Documents/Psychosis/Data/')
+setwd('C:/Users/ch170655/Documents/Psychosis/Data/')
+
+require(lubridate)
+require(ggplot2)
+```
+
+## Define Global Functions
+```{r define_functions, echo=FALSE, warning=FALSE}
+
+# Functions Decleration  --------------------------------------------------------------------------
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+showIQR <- function(x, n_digits = 1){
+  a = round(quantile(x, probs = c(0.25,0.75)), digits = n_digits)
+  res = paste(a['25%'],'-',a['75%'],sep='')
+  return(res)
+}
+showMedianAndIQR <- function(x, n_digits = 1){
+  IQR = showIQR(x, n_digits)
+  med = round(median(x), digits = n_digits)
+  return(paste(med,' [',IQR,']',sep = ''))
+}
+showMedianAndRange <- function(x, n_digits = 1){
+  range = paste(round(c(min(x),max(x)), n_digits), collapse = '-')
+  med = round(median(x), digits = n_digits)
+  return(paste(med,' [',range,']',sep = ''))
+}
+
+showMeanAnd95CI <- function(x, n_digits = 1){
+  tt = t.test(x)
+  ci = paste(round(c(tt$conf.int[1],tt$conf.int[2]), n_digits), collapse = '-')
+  ave = round(tt$estimate, digits = n_digits)
+  return(paste(ave,' [',ci,']',sep = ''))
+}
+
+
+showCountAndPercent <- function(count, total,n_digits = 1){
+  prcnt = round(100 * count / total, digits = n_digits)
+  res = paste(prcnt, '% (n=',count,')',sep = '')
+  return(res)
+}
+getBirthYear <- function(dates_str){
+  res = as.numeric(gsub('.+/.+/','',dates_str))
+}
+
+getFactorSummaryString <- function(a){
+  s = summary(a); s = s[order(s, decreasing = T)]
+  res = paste(paste(paste(names(s), round(100*s / length(a), digits = 1), sep = '='), collapse = '%, '), '%',sep='')
+  return(res)
+}
+
+showCountandRate <- function(m,n,n_digits=1){ return(paste(m,' (',round(100 * m / n, digits = n_digits),'%)',sep='')) }
+
+getSummaryStatsTbl <- function(roc.res){
+  res = data.frame()
+  for(spec in c(0.8,0.9,0.95,0.99)){
+    res = rbind(res, round(coords(roc.res, x = spec, input = 'specificity', ret = c('spec','sen','ppv','npv', 'tp','fp','tn','fn'), transpose = F), digits = 2))
+  }
+  res$AUC = round(roc.res$auc, digits = 2)
+  for(col in c('tp','fp','tn','fn')) res[,col] <- round(res[,col], digits = 0)
+  return(res)
+}
+
+# postfix = 'AllControls' | 'SelectedControls' 
+getModelPerformance <- function(postfix, cases, included_ids)
+{
+  res = data.frame()
+  for (PRED_AGE in c(15,20,25,30)){
+    print(paste('------------------------ Age =',PRED_AGE,'------------------------'))
+    for (FOLLOW_UP in c(1,5,NA)){
+      rf_fit_filename = paste('rf.fit2.follow_up_',FOLLOW_UP,'_age_',PRED_AGE,'_',postfix,'.RDs',sep='')
+      if(file.exists(rf_fit_filename)){
+        print(paste('------------------------ Follow-Up =',FOLLOW_UP,'------------------------'))
+        testing <- readRDS(paste('testing.followup_',FOLLOW_UP,'_age_',PRED_AGE,'_','AllControls2','.RDs',sep=''))
+        training <- readRDS(paste('training.followup_',FOLLOW_UP,'_age_',PRED_AGE,'_','AllControls2','.RDs',sep=''))
+        rf.fit = readRDS(rf_fit_filename) 
+        
+        if (length(included_ids) > 0){
+          training <- training[rownames(training) %in% as.character(included_ids), ]
+          testing <- testing[rownames(testing) %in% as.character(included_ids), ]
+        }
+        
+        imp_vars = varImpPlot(rf.fit, main = paste('Prediction age:',PRED_AGE))
+        imp_vars <- rownames(imp_vars)[order(imp_vars, decreasing = T)]
+        print(paste(imp_vars[1:10], collapse = ', '))
+        
+        # make sure that the testing set doesn't include information not available before for the model
+        missing_lvls = levels(testing$current_zip3)[!(levels(testing$current_zip3) %in% levels(training$current_zip3))]
+        if(length(missing_lvls) > 0){
+          testing$current_zip3[testing$current_zip3 %in% missing_lvls] <- 'Other'
+          testing$current_zip3 <- factor(as.character(testing$current_zip3))
+        }
+        
+        # apply model on testing set
+        rf.pred = predict(rf.fit, testing, type = 'prob')
+        roc.res = roc(testing$isCase, rf.pred[,2])
+        print(roc.res$auc)
+        stats_tbl = getSummaryStatsTbl(roc.res)
+        
+        for(specificity in c(0.9, 0.95, 0.99)){
+          # get subjects identified by the model (score > cutoff)
+          cutoff_score = quantile(rf.pred[,2][testing$isCase == F], probs = specificity)
+          identified_cases = rownames(testing)[which(testing$isCase == T & rf.pred[,2] > cutoff_score)]
+          # get the number of years from prediction till index-event
+          time_till_index = cases$table1_start_age[match(identified_cases, cases$PATIENT_ID)] - PRED_AGE
+          
+          res = rbind(res, data.frame(ModelType = postfix, 
+                                      TimeWindow = FOLLOW_UP,
+                                      Age = PRED_AGE,
+                                      Specificity = specificity,
+                                      Cases = showCountandRate(sum(testing$isCase == 'TRUE'), nrow(testing)),
+                                      Controls = showCountandRate(sum(testing$isCase == 'FALSE'), nrow(testing)),
+                                      AUC = round(roc.res$auc,digits = 2),
+                                      PPV = stats_tbl$ppv[stats_tbl$specificity == specificity],
+                                      NPV = stats_tbl$npv[stats_tbl$specificity == specificity],
+                                      TimeTillIndex = showMedianAndIQR(time_till_index)))
+          
+        }        
+      } else {
+        res = rbind(res, data.frame(ModelType = postfix, TimeWindow = FOLLOW_UP, Age = PRED_AGE,
+                                    Specificity = NA,
+                                    Cases = NA,
+                                    Controls = NA,
+                                    AUC = NA,
+                                    PPV = NA,
+                                    NPV = NA,
+                                    TimeTillIndex = NA))
+        
+      }
+    }
+  } 
+  return(res)
+}
+
+getSummaryStatsTbl <- function(roc.res){
+  res = data.frame()
+  for(spec in c(0.8,0.9,0.95,0.99)){
+    res = rbind(res, round(coords(roc.res, x = spec, input = 'specificity', ret = c('spec','sen','ppv','npv', 'tp','fp','tn','fn'), transpose = F), digits = 2))
+  }
+  res$AUC = round(roc.res$auc, digits = 2)
+  for(col in c('tp','fp','tn','fn')) res[,col] <- round(res[,col], digits = 0)
+  return(res)
+}
+
+getModelPerformance2 <- function(postfix, cases, included_ids)
+{
+  res = data.frame()
+  for (PRED_AGE in c(15,20,25,30)){
+    print(paste('------------------------ Age =',PRED_AGE,'------------------------'))
+    for (FOLLOW_UP in c(3)){ # 1,5,NA
+      print(paste('------------------------ Follow-Up =',FOLLOW_UP,'------------------------'))
+      # load files (testing cohort + RF model)
+      testing <- readRDS(paste('testing.followup_',FOLLOW_UP,'_age_',PRED_AGE,'_',postfix,'.RDs',sep=''))
+      rf.fit = readRDS(paste('rf.fit2.follow_up_',FOLLOW_UP,'_age_',PRED_AGE,'_',postfix,'.RDs',sep='')) 
+      testing <- testing[rownames(testing) %in% as.character(included_ids), ]
+      
+      # apply model on testing set
+      rf.pred = predict(rf.fit, testing)
+      pred_score = rf.pred$predicted[,'TRUE']
+      roc.res = roc(rf.pred$yvar == 'TRUE', pred_score)
+      stats_tbl = getSummaryStatsTbl(roc.res)
+      
+      for(specificity in c(0.9, 0.95, 0.99)){
+        # get subjects identified by the model (score > cutoff)
+        cutoff_score = quantile(pred_score[testing$isCase == F], probs = specificity)
+        identified_cases = rownames(testing)[which(testing$isCase == T & pred_score > cutoff_score)]
+        # get the number of years from prediction till index-event
+        time_till_index = cases$table1_start_age[match(identified_cases, cases$PATIENT_ID)] - PRED_AGE
+        
+        res = rbind(res, data.frame(ModelType = postfix, 
+                                    TimeWindow = FOLLOW_UP,
+                                    Age = PRED_AGE,
+                                    Specificity = specificity,
+                                    Cases = showCountandRate(sum(testing$isCase == 'TRUE'), nrow(testing)),
+                                    Controls = showCountandRate(sum(testing$isCase == 'FALSE'), nrow(testing)),
+                                    AUC = round(roc.res$auc,digits = 2),
+                                    PPV = stats_tbl$ppv[stats_tbl$specificity == specificity],
+                                    NPV = stats_tbl$npv[stats_tbl$specificity == specificity],
+                                    TimeTillIndex = showMedianAndIQR(time_till_index)))
+        
+      }        
+    }
+  } 
+  return(res)
+}
+
+```
+
+## Load Data
+```{r load_data, echo = FALSE}
+setwd('C:/Users/ch170655/Documents/Psychosis/Data/')
+
+# the subjects meeting the specific controls case definition
+cases = readRDS('./cases.RDs')
+controls = readRDS('controls_ CONTROLS .RDs') 
+controls.sample = readRDS('controls_CONTROLS_sample.RDs')
+
+# the list of index dates (index event for cases, last documented encounter for controls)
+index_events = readRDS('index_events.RDs')
+
+# get all available subjects from demographics dataset
+all_subjects = readRDS('./demographics.RDs')
+all_subjects = all_subjects[!duplicated(all_subjects$PATIENT_ID), ]
+
+# subjects included for models
+included_subjects = all_subjects[all_subjects$PATIENT_ID %in% c(cases$PATIENT_ID, controls$PATIENT_ID), ]
+included_subjects.sample = all_subjects[all_subjects$PATIENT_ID %in% c(cases$PATIENT_ID, controls.sample$PATIENT_ID), ]
+cases_dem = included_subjects[included_subjects$PATIENT_ID %in% cases$PATIENT_ID, ]
+```
+
+
+# summary stats for included cohort
+```{r cohort_summary_stats, echo = FALSE}
+
+# look at the distribution of cases over time
+cases_months = month(cases$index_date)
+cases_years = year(cases$index_date)
+a = tapply(cases$PATIENT_ID, paste(1,cases_months,cases_years,sep='/'), length)
+plot_data = data.frame(x = strptime(names(a), format = '%d/%m/%Y'), y = a)
+barplot(plot_data$y ~ plot_data$x)
+
+# examine controls birth date vs. cases
+plot_data = data.frame(x = c(cases$birth_date, controls$BIRTH_DATE), y = c(rep('Case',nrow(cases)), rep('Control',nrow(controls))))
+ggplot(data = plot_data, aes(x = x, fill = y)) + 
+    geom_histogram( color="#e9ecef", alpha=0.6, position = 'identity', aes(y=..density..)) +
+    scale_fill_manual(values=c("#69b3a2", "#404080")) +
+    theme_minimal() +
+    labs(fill="")
+```
+
+
+## Analysis of available prior Encounters (you can ignore this block for now)
+```{r encounters, echo = FALSE}
+# summary of encounters prior to FEP - 17,886,693 x 3 (patient_id, encounter_num, start_date)
+encounters = readRDS('encounters.included.RDs')
+encounters = encounters[encounters$PATIENT_ID %in% included_subjects$PATIENT_ID, ]
+
+# create unique encounter identification number for encounters with >24 hours between them
+encounters = encounters[order(encounters$PATIENT_ID, encounters$START_DATE), ]
+encounters$time_from_last_encounter = c(NA, difftime(encounters$START_DATE[-1], encounters$START_DATE[-nrow(encounters)], units = 'hours'))
+id_change = c(TRUE, encounters$PATIENT_ID[-1] != encounters$PATIENT_ID[-nrow(encounters)])
+encounters$time_from_last_encounter[which(id_change)] <- NA
+encounters$unique_encounter = is.na(encounters$time_from_last_encounter) | (encounters$time_from_last_encounter > 24)
+
+
+cases_encounters = merge(cases[, c('PATIENT_ID', 'table1_start')], encounters, by = 'PATIENT_ID', all.x = T, all.y = F)
+cases_encounters = cases_encounters[order(cases_encounters$PATIENT_ID, cases_encounters$START_DATE), ]
+cases_prior_encounters = cases_encounters[cases_encounters$START_DATE < (cases_encounters$table1_start - (2*365*3600*24)), ]
+# option 1: look at all encounters, only discriminating by encounter num
+cases_prior_encounters_count = tapply(cases_prior_encounters$PATIENT_ID, cases_prior_encounters$PATIENT_ID, length)
+# option 2: treat encounters as the same as long as there is <=24 hours between them
+cases_prior_encounters_count = tapply(cases_prior_encounters$unique_encounter, cases_prior_encounters$PATIENT_ID, sum)
+summary(cases_prior_encounters_count)
+
+# investigate the outliers: 
+# ids = names(cases_prior_encounters_count)[which(cases_prior_encounters_count > 100)]
+# for(id in sample(ids, 1)){
+#   d = cases_encounters[cases_encounters$PATIENT_ID == id, ]
+#   print(d[order(d$START_DATE), ])
+# }
+
+```
+
+## Create Table-1
+```{r summary_stats, eval = FALSE}
+# 2. Get Stats on Cases and Controls  --------------------------------------------------------------------------
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+require(lubridate)
+
+generateTable1 <- function(all_subjects, included_subjects, cases_dem, controls){
+  table_1 = data.frame()
+  
+  included_subjects = included_subjects[included_subjects$PATIENT_ID %in% all_subjects$PATIENT_ID, ]
+  cases_dem = cases_dem[cases_dem$PATIENT_ID %in% all_subjects$PATIENT_ID, ]
+  controls = controls[controls$PATIENT_ID %in% all_subjects$PATIENT_ID, ]
+  
+  table_1 = rbind(table_1, data.frame(feature = 'Count', All = nrow(all_subjects), Included = nrow(included_subjects), Cases = nrow(cases_dem), Controls = nrow(controls)))
+  table_1 = rbind(table_1, data.frame(feature = 'Sex', All = getFactorSummaryString(all_subjects$SEX_CD), Included = getFactorSummaryString(included_subjects$SEX_CD), Cases = getFactorSummaryString(cases_dem$SEX_CD), Controls = getFactorSummaryString(controls$SEX_CD)))
+  table_1 = rbind(table_1, data.frame(feature = 'Birth Year', 
+                                      All = median(year(all_subjects$BIRTH_DATE)), 
+                                      Included = median(year(included_subjects$BIRTH_DATE)), 
+                                      Cases = median(year(cases_dem$BIRTH_DATE)), 
+                                      Controls = median(year(controls$BIRTH_DATE))))
+  # table_1 = rbind(table_1, data.frame(feature = 'Race', All = getFactorSummaryString(all_subjects$race), Included = getFactorSummaryString(included_subjects$race), Cases = getFactorSummaryString(cases_dem$race), Controls = getFactorSummaryString(controls$race)))
+  # table_1 = rbind(table_1, data.frame(feature = 'Ethnicity', All = getFactorSummaryString(all_subjects$ethnicity), Included = getFactorSummaryString(included_subjects$ethnicity), Cases = getFactorSummaryString(cases_dem$ethnicity), Controls = getFactorSummaryString(controls$ethnicity)))
+  table_1 = rbind(table_1, data.frame(feature = 'Marital Status', All = getFactorSummaryString(all_subjects$MARITAL_STATUS_CD), Included = getFactorSummaryString(included_subjects$MARITAL_STATUS_CD), Cases = getFactorSummaryString(cases_dem$MARITAL_STATUS_CD), Controls = getFactorSummaryString(controls$MARITAL_STATUS_CD)))
+  
+  return(table_1)
+}
+
+
+table_1
+write.csv(table_1, 'table1.csv')
+
+# extract p-values for table-1
+case_def = factor(c(rep('all', nrow(included_subjects)), rep('cases', nrow(cases_dem))))
+chisq.test( factor(c(as.character(included_subjects$SEX_CD), as.character(cases_dem$SEX_CD))), case_def )
+# chisq.test( factor(c(as.character(included_subjects$race), as.character(cases_dem$race))), case_def )
+chisq.test( factor(c(as.character(included_subjects$MARITAL_STATUS_CD), as.character(cases_dem$MARITAL_STATUS_CD))), case_def )
+
+# age of FEP
+summary(cases$table1_start_age)
+```
+
+
+```{r table1_sub_populations}
+# get first & last encounter for each subject
+encounters = readRDS('encounters.included.RDs')
+encounters$BIRTH_DATE = all_subjects$BIRTH_DATE[match(encounters$PATIENT_ID, all_subjects$PATIENT_ID)]
+encounters$age = round(as.numeric(difftime(encounters$START_DATE, encounters$BIRTH_DATE, units = 'days')) / 365.25, digits = 1)
+
+# check if there are subjects without any encounter data
+sum( !(all_subjects$PATIENT_ID %in% unique(encounters$PATIENT_ID)) )
+
+encounters = encounters[order(encounters$PATIENT_ID, encounters$START_DATE), ]
+first_encounter = encounters[!duplicated(encounters$PATIENT_ID), ]
+last_encounter = encounters[rev(!duplicated(rev(encounters$PATIENT_ID))), ]
+age_range = merge(first_encounter[, c('PATIENT_ID', 'age')], last_encounter[, c('PATIENT_ID', 'age')], by='PATIENT_ID')
+colnames(age_range)[2:3] <- c('first_age', 'last_age')
+age_range = age_range[!is.na(age_range$first_age) & !is.na(age_range$last_age), ]
+
+pred_age = 15
+potential_subjects = age_range$PATIENT_ID[age_range$first_age < pred_age & age_range$last_age > (pred_age+5)]
+print(paste('Age=',pred_age,', subjects=',length(potential_subjects)))
+table1_sub = generateTable1(all_subjects[all_subjects$PATIENT_ID %in% potential_subjects, ],
+                            included_subjects, 
+                            cases_dem, 
+                            controls)
+  
+  createTable1(, included_subjects, cases_dem, controls)
+  
+write.csv(table1_sub, paste('table1_age_',pred_age,'.csv',sep=''))
+
+```
+
+
+## Table 2
+```{r table_2, eval = FALSE}
+# 3. Get number of available patients for each model (Table 2)  -------------------------------------
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# this needs to be re-written - I currently do not save this csv table
+
+# table2 <- read.csv('./all_ages_stats.csv') # file name is misleading but this includes only true-controls
+# print(table2)
+# print(sum(as.numeric(gsub(' .+', '', table2$cases[table2$follow_up == 5]) )))
+```
+
+
+##  Run Models 
+
+## Naive Bayes Model
+```{r random_forest_survival_model, echo = FALSE}
+require(pROC)
+
+#
+# genORTable - create a table of odds-ratio to outcome for each concept code
+# input: 
+#   concept_code: the independent risk factors (taken from model.data dataset)
+#   case_def: binary flag (True/False) indicating if the code is taken from case (True) or control (False)
+#   min_count: the minimum number of times each concept needs to appear in order to be included in final table
+# output: a table with the odds ratio for each concept, including the following columns: 
+#   concept_code, cases (cases count), controls (controls count), total count (cases+controls), OR (odds-ratio)
+#   * the dataset is ordered from highest to lowest OR
+#
+genORTable <- function(concept_code, case_def, min_count = 20){
+  
+  total_cases = sum(case_def); total_controls = sum(!case_def)
+  concept_code.cases = tapply(case_def, concept_code, sum)
+  concept_code.controls = tapply(!case_def, concept_code, sum)
+  
+  res = data.frame(concept_code = names(concept_code.cases), cases = concept_code.cases, controls = concept_code.controls)
+  res$total_count = res$cases + res$controls
+  res <- res[res$total_count > min_count, ]
+  
+  res$OR <- round((res$cases / (total_cases - res$cases)) / (res$controls / (total_controls - res$controls)), digits = 1)
+  res <- res[order(res$OR, res$cases, decreasing = T), ]
+  return(res)
+}
+
+addNBCScores <- function(pred.data, PRED_AGE, reCalcORTable = F)
+{
+  # keep only one occurrence from each concept code
+  # pred.data = pred.data[order(pred.data$PATIENT_ID, pred.data$date), ] --> should be sorted already
+  pred.data.unique = pred.data[!duplicated(paste(pred.data$PATIENT_ID, pred.data$concept_type, pred.data$concept_code,sep = '_')), ]
+
+  
+  training = pred.data.unique[pred.data.unique$isTraining == T, ]
+  testing = pred.data.unique[pred.data.unique$isTraining == F, ]
+  
+  if (reCalcORTable == T){
+    odds_ratios = genORTable(concept_code = paste(training$concept_type, training$concept_code,sep='_'), 
+                           case_def = training$isCase, 
+                           min_count = 20)    
+  } else {
+    # load previously calculated odds-ratios
+    odds_ratios = readRDS(paste('./odds_ratio.age_',PRED_AGE,'.RDs',sep=''))
+  }
+  # replace infinite ORs (patients with 0 controls) with the max OR value 
+  odds_ratios$OR[is.infinite(odds_ratios$OR)] <- max(odds_ratios$OR[!is.infinite(odds_ratios$OR)], na.rm = T)
+  # replace OR=0 with minimum OR which is > 0
+  odds_ratios$OR[odds_ratios$OR == 0] <- min(odds_ratios$OR[odds_ratios$OR > 0], na.rm = T)
+    
+  # add NBC score to each row in prediction data
+  pred.data.unique$NBC = log(odds_ratios$OR[match(paste(pred.data.unique$concept_type, pred.data.unique$concept_code,sep = '_'), odds_ratios$concept_code)])
+  pred.data.unique$NBC[is.na(pred.data.unique$NBC)] <- 0
+  
+  # calc cumulative NBC over time
+  pred.data.unique$sumNBC = unlist(tapply(pred.data.unique$NBC, pred.data.unique$PATIENT_ID, cumsum))
+  
+  # add the rounded age in years (rounded up)
+  pred.data.unique$age_rounded = ceiling(pred.data.unique$age)
+  
+  saveRDS(pred.data.unique, paste('./nbc_scored.age_',PRED_AGE,'.RDs',sep=''))  
+  
+  return(pred.data.unique)
+}
+
+
+for(PRED_AGE in c(15)){ # ,20,25,30
+  print(paste('pred age:',PRED_AGE))
+  # load data for prediction
+  
+  # get pred data with NBC score
+  
+  # if you need to re-generate these scores just uncomment and run the next 2 command (e.g. 1st time running code)
+  pred.data = readRDS(paste('./pred.data.age_',PRED_AGE,'.RDs',sep=''))
+  
+  # optional: limit time-window of prediction to 5 years
+  # only include cases that met the case definition between the age of PRED_AGE & PRED_AGE+5
+  cases_to_include = cases$PATIENT_ID[!is.na(cases$index_age) & 
+                                        (cases$index_age > PRED_AGE) & 
+                                        (cases$index_age < (PRED_AGE+5))]
+  # only include controls with follow-up for the entire time window
+  controls_to_include = controls$PATIENT_ID[!is.na(controls$index_age) & 
+                                              (controls$index_age > (PRED_AGE+5))]
+  # filter to include only included cases & controls
+  pred.data <- pred.data[pred.data$PATIENT_ID %in% c(cases_to_include, controls_to_include), ]
+  pred.data$isCase <- ifelse(pred.data$PATIENT_ID %in% cases_to_include, TRUE, FALSE)
+  
+  # optional: filter patients with insufficient follow-up data
+  pred.data = pred.data[order(pred.data$PATIENT_ID, pred.data$age), ]
+  subjects_first_age = pred.data[!duplicated(pred.data$PATIENT_ID), c('PATIENT_ID', 'age', 'isCase')]
+  
+  # filter to include patients with sufficient history
+  
+  # first, study the effect of different cutoff on available data
+  summary(subjects_first_age$isCase)
+  for (history_period in c(0, 0.5, 1, 2, 3)){
+    print(paste('History >',history_period,'years'))
+    df = subjects_first_age[subjects_first_age$age < (PRED_AGE-history_period), ]
+    print(summary(df$isCase))
+  }
+  # now filter to include only subjects with enough history (>2 years)
+  patients_with_history_to_include = subjects_first_age$PATIENT_ID[subjects_first_age$age < (PRED_AGE-2)]
+  pred.data = pred.data[pred.data$PATIENT_ID %in% patients_with_history_to_include, ]
+  
+  # add the NBC scores (and save an RDs with the scored file)
+  pred.data.scored = addNBCScores(pred.data, PRED_AGE, reCalcORTable = T) # 
+  
+  # load already scored NBC scores (if not 1st time running uncomment next line and comment above 2 lines)
+  # pred.data.scored = readRDS(paste('./nbc_scored.age_',PRED_AGE,'.RDs',sep=''))
+  
+  total_cases = sum(!duplicated(pred.data.scored$PATIENT_ID[pred.data.scored$isCase == T]))
+  total_controls = sum(!duplicated(pred.data.scored$PATIENT_ID[pred.data.scored$isCase == F]))
+  print(paste('Pred age',PRED_AGE, 'Cases=',total_cases,'Controls=',total_controls, 'Prcnt cases=', round(100 * (total_cases / (total_cases + total_controls)), digits = 1),'%' ))
+
+  # plot NBC score by age for cases vs. controls
+  # get only testing set and only last score for each year of age (rounding up the ages for this)
+  plot_data = pred.data.scored[(pred.data.scored$isTraining == F) & !duplicated(paste(pred.data.scored$PATIENT_ID, pred.data.scored$age_rounded,sep='_')), ]
+  plot_data = plot_data[plot_data$age > 0, ]
+  
+  # number of patients in testing set
+  total_count =sum(!duplicated(plot_data$PATIENT_ID))
+  p = ggplot(data = plot_data, aes(x = age_rounded, y = sumNBC, color = isCase, fill = isCase)) +
+      stat_summary(geom="ribbon", fun.data=mean_cl_normal, fun.args=list(conf.int=0.95), alpha = 0.5)+ # fill="lightblue"
+      stat_summary(geom="line", fun.y=mean, linetype="dashed") +
+      stat_summary(geom="point", fun.y=mean) + # color="red"
+      theme_minimal() + xlab('Age (Years)') + ylab('NBC Score') + ggtitle(paste('Age at prediction =',PRED_AGE,'years (n=',total_count,')')) + 
+      scale_color_manual(values=c("blue", "red")) + scale_fill_manual(values=c("lightblue", "lightcoral")) + ylim(-100,50)
+  print(p)  
+  
+  last_nbc_score = pred.data.scored[rev(!duplicated(rev(pred.data.scored$PATIENT_ID))), ]
+  last_nbc_score = last_nbc_score[last_nbc_score$isTraining == F, ]
+  roc.res = roc(last_nbc_score$isCase ~ last_nbc_score$sumNBC)
+  summary_stats = getSummaryStatsTbl(roc.res)
+  write.csv(summary_stats, paste('nbc_summary_stats_timewindow5Y_age_',PRED_AGE,'.csv',sep=''))
+  print(roc.res)
+  paste(summary_stats$tp + summary_stats$fn, (summary_stats$tp + summary_stats$fn)/(summary_stats$tp + summary_stats$fn + summary_stats$tn + summary_stats$fp))
+  print(summary_stats)
+}
+
+
+
+# apply score on testing set, this time including all controls - not only down-sampled cohort
+
+```
+
+## Get top predictors
+```{r get_top_predictors, echo = FALSE}
+
+# # Create dictionaries for DXs, meds, labs
+# dx_dict = readRDS('./diagnosis.included.RDs')
+# dx_dict = dx_dict[!duplicated(dx_dict$DIAGNOSIS_CODE), ]
+# saveRDS(dx_dict, './dx_dict.RDs')
+# 
+# labs_dict = readRDS('./labs.RDs')
+# labs_dict = labs_dict[!duplicated(labs_dict$LAB_CODE), ]
+# saveRDS(labs_dict, './labs_dict.RDs')
+# 
+# meds_dict = readRDS('./meds.RDs')
+# meds_dict = meds_dict[!duplicated(meds_dict$MED_CODE), ]
+# saveRDS(meds_dict, './meds_dict.RDs')
+
+# load dictionaries that were already created
+dx_dict = readRDS('./dx_dict.RDs')
+labs_dict = readRDS('./labs_dict.RDs')
+meds_dict = readRDS('./meds_dict.RDs')
+
+# add concept name to the odds ratio table
+for(PRED_AGE in c(15)){
+  print(paste('PRED AGE', PRED_AGE))
+  odds_ratios = readRDS(paste('./odds_ratio.age_',PRED_AGE,'.RDs',sep=''))
+  
+  dx_idxs = grep('dx_', odds_ratios$concept_code)
+  labs_idxs = grep('labs_', odds_ratios$concept_code)
+  meds_idxs = grep('meds_', odds_ratios$concept_code)
+  
+  odds_ratios$description = ''
+  odds_ratios$description[dx_idxs] = dx_dict$DIAGNOSIS_NAME[match(gsub('dx_','',odds_ratios$concept_code[dx_idxs]), dx_dict$DIAGNOSIS_CODE)]
+  odds_ratios$description[labs_idxs] = labs_dict$LAB_NAME[match(gsub('labs_','',odds_ratios$concept_code[labs_idxs]), labs_dict$LAB_CODE)]
+  odds_ratios$description[meds_idxs] = meds_dict$MED_NAME[match(gsub('meds_','',odds_ratios$concept_code[meds_idxs]), meds_dict$MED_CODE)]
+  saveRDS(odds_ratios, paste('./odds_ratio.age_',PRED_AGE,'.RDs',sep=''))
+  
+  print(odds_ratios[1:20, ])
+  write.csv(odds_ratios[1:20, ], paste('./top_risk_factors.age_',PRED_AGE,'.csv',sep=''))
+}
+
+# debug cheat codes
+pred.data.scored = readRDS(paste('./nbc_scored.age_',25,'.RDs',sep=''))
+
+ids = unique(pred.data.scored$PATIENT_ID[pred.data.scored$concept_code == 'ICD9:298.9'])
+
+View(pred.data.scored[pred.data.scored$PATIENT_ID %in% ids[1:5], ])
+```
+
+
+
+## Random Forest Survival Model
+```{r random_forest_survival_model, echo = FALSE}
+require(randomForestSRC)
+require(caret)
+require(Hmisc)
+
+PRED_AGE = 15
+
+
+# 1) load required data and divide into training and testing
+pred.data.flat = readRDS(paste('./pred.data.flat.age_',PRED_AGE,'.RDs',sep=''))
+
+# optional: limit prediction time window to 5 years
+cases_to_exclude = cases$PATIENT_ID[cases$index_age < PRED_AGE | cases$index_age > (PRED_AGE+5)]
+pred.data.flat$isCase[rownames(pred.data.flat) %in% cases_to_exclude] <- FALSE
+
+training = pred.data.flat[pred.data.flat$isTraining == 1, ]
+testing = pred.data.flat[pred.data.flat$isTraining == 0, ]
+
+# 2) hyperparameter tuning using k-fold cross validation
+hyper_grid <- expand.grid(
+  ntree = c(128, 256, 512, 1024),
+  mtry = seq(2, 10, 2),
+  nodesize = seq(1, 5, 1),
+  nsplit = c(1, 3, 5, 10, 15)
+)
+
+k <- 5
+folds <- createFolds(training$isCase, k = k, list = TRUE, returnTrain = TRUE)
+
+
+results <- matrix(NA, nrow = nrow(hyper_grid), ncol = k)
+colnames(results) <- paste0("Fold", 1:k)
+
+for (i in 1:nrow(hyper_grid)) {
+  print(paste('hyper param: row',i,'/',nrow(hyper_grid)))
+  ntree <- hyper_grid$ntree[i]
+  mtry <- hyper_grid$mtry[i]
+  nodesize <- hyper_grid$nodesize[i]
+  nsplit <- hyper_grid$nsplit[i]
+  
+  for (j in 1:k) {
+    training_set <- training[folds[[j]], ]
+    validation_set <- training[-folds[[j]], ]
+    
+    model <- rfsrc(
+      Surv(timeTillEvent,isCase) ~ .,
+      data = training_set,
+      ntree = ntree,
+      mtry = mtry,
+      nodesize = nodesize,
+      nsplit = nsplit
+    )
+    
+    predictions <- predict(model, validation_set, times = 5) # predict at 5 years
+
+    five_year_idx = which.min(abs(predictions$time.interest - 5))
+    c_index_result <- rcorr.cens(-predictions$survival[,five_year_idx], 
+                                 Surv(predictions$yvar$timeTillEvent, predictions$yvar$isCase))
+
+    results[i, j] <- c_index_result[['C Index']]
+  }
+}
+
+# determine the best configuration
+
+mean_c_indices <- rowMeans(results, na.rm = TRUE)
+
+hyper_grid$mean_c_index <- mean_c_indices
+
+best_hyperparameters <- hyper_grid[which.max(hyper_grid$mean_c_index), ]
+
+
+optimal_ntree <- best_hyperparameters$ntree # 128
+optimal_mtry <- best_hyperparameters$mtry # 2
+optimal_nodesize <- best_hyperparameters$nodesize # 4
+optimal_nsplit <- best_hyperparameters$nsplit # 1
+
+optimal_ntree = 128; optimal_mtry = 2; optimal_nodesize = 4; optimal_nsplit = 1;
+
+# 3) train the tuned RFSRC model using the training data
+rfs.fit = rfsrc(Surv(timeTillEvent,isCase)~., data = training, 
+               ntree = optimal_ntree, 
+               mtry = optimal_mtry, 
+               nodesize = optimal_nodesize, 
+               nsplit = optimal_nsplit, 
+               importance = TRUE)
+saveRDS(rfs.fit, paste('rfs.fit.timeWindow5_age_',PRED_AGE,'.RDs',sep=''))
+# rfs.fit = readRDS(paste('rfs.fit.age_',PRED_AGE,'.RDs',sep=''))
+
+# 4) apply the fitted/trained model on the testing set
+y.pred <- predict(rfs.fit,newdata = testing, times = 5)
+
+# a. plot survival curves for cases & controls
+survival_cases = y.pred$survival[which(y.pred$yvar$isCase == 1), ]
+survival_controls = y.pred$survival[which(y.pred$yvar$isCase == 0), ]
+survival_cases_mean = apply(survival_cases, 2, mean)
+survival_cases_sd = apply(survival_cases, 2, sd)
+survival_controls_mean = apply(survival_controls, 2, mean)
+survival_controls_sd = apply(survival_controls, 2, sd)
+
+plot_data = rbind(data.frame(year = 1:length(survival_cases_mean), survival = survival_cases_mean, std = survival_cases_sd, is_case = TRUE), 
+  data.frame(year = 1:length(survival_controls_mean), survival = survival_controls_mean, std = survival_controls_sd, is_case = FALSE))
+
+p <- ggplot(data = plot_data[plot_data$year <= 20, ], aes(x = year, y = survival, fill = is_case, color = is_case)) + geom_ribbon(aes(ymin = survival - std, ymax = survival + std, group=is_case), alpha = 0.1) + geom_line(size = 1) + theme_minimal() + ggtitle(paste('Pred age = ', PRED_AGE))  
+print(p)
+
+# b. Evaluate the overall performance of the model (use 5-years time point)
+five_year_idx = which.min(abs(y.pred$time.interest - 5))
+a = data.frame(pred = y.pred$survival[,five_year_idx], true_time = y.pred$yvar$timeTillEvent, isCase = y.pred$yvar$isCase)
+View(a)
+
+c_index_result <- rcorr.cens(1-y.pred$survival[,five_year_idx], 
+                             Surv(y.pred$yvar$timeTillEvent, y.pred$yvar$isCase))
+
+# cindex = pec::cindex(list("RFS"=rf.fit), formula = Surv(timeTillEvent,isCase) ~ ., data = testing, eval.times = 40)
+```
+
+## Random Forest Classification Model
+```{r classification_models, echo = FALSE}
+
+reduceNumberOfFactorLevels <- function(fctr, num_levels){
+  s = summary(fctr)
+  lvls_to_include = names(s)[1:num_levels]
+  fctr = as.character(fctr)
+  fctr[!(fctr %in% lvls_to_include)] <- 'Other'
+  fctr = factor(fctr)
+  
+  return(fctr)
+}
+
+require(randomForest)
+require(pROC)
+# Run Random Forest to discern between cases & controls (any time in the future)
+# Run prediction at the land-mark age point
+
+# set PERFORM_HYPER_PARAM_TUNING to TRUE if you want to re-tune the model
+PERFORM_HYPER_PARAM_TUNING = FALSE
+
+# 1) load required data and divide into training and testing
+pred.data.flat = readRDS(paste('C:/Users/ch170655/Documents/Psychosis/Data/pred.data.flat.age_',PRED_AGE,'.RDs',sep=''))
+
+# optional: limit prediction time window to 5 years
+cases_to_include = as.character(cases$PATIENT_ID[!is.na(cases$index_age) & (cases$index_age > PRED_AGE) & (cases$index_age < (PRED_AGE+5))])
+controls_to_include = as.character(controls$PATIENT_ID[!is.na(controls$index_age) & (controls$index_age > (PRED_AGE+5))])
+all_potential_subjects = 
+
+pred.data.flat <- pred.data.flat[rownames(pred.data.flat) %in% c(cases_to_include, controls_to_include), ]
+pred.data.flat$isCase <- 0
+pred.data.flat$isCase[rownames(pred.data.flat) %in% cases_to_include] <- 1
+
+# show Table 1 for this cohort
+generateTable1 <- function(all_subjects[all_subjects$PATIENT_ID %in% ], included_subjects, cases_dem, controls)
+
+# optional: only include patients with sufficient history
+pred.data.flat <- pred.data.flat[rownames(pred.data.flat) %in% patients_with_history_to_include,]
+
+# add demographics data
+pred.data.flat$ethnicity <- reduceNumberOfFactorLevels(pred.data.flat$ethnicity, 10)
+pred.data.flat$isCase <- factor(pred.data.flat$isCase)
+colnames(pred.data.flat) <- make.names(colnames(pred.data.flat))
+
+# include only selected vars
+topvars = read.csv('./topvars_rf_model.csv')
+
+training = pred.data.flat[pred.data.flat$isTraining == 1, topvars]
+testing = pred.data.flat[pred.data.flat$isTraining == 0, topvars]
+
+cases_idxs = which(training$isCase == 1)
+controls_idxs = which(training$isCase == 0)
+controls_idxs_sample = sample(controls_idxs, length(cases_idxs) * 4, replace = F)
+training.sample = training[c(cases_idxs, controls_idxs_sample), ]
+
+if (PERFORM_HYPER_PARAM_TUNING)
+{
+  # 2) hyperparameter tuning using k-fold cross validation
+  hyper_grid <- expand.grid(
+    ntree = c(128, 256, 512, 1024),
+    mtry = seq(2, 10, 2),
+    nodesize = seq(1, 5, 1),
+    nsplit = c(1, 3, 5, 10, 15)
+  )
+  
+  k <- 3
+  folds <- createFolds(training.sample$isCase, k = k, list = TRUE, returnTrain = TRUE)
+  
+  results <- matrix(NA, nrow = nrow(hyper_grid), ncol = k)
+  colnames(results) <- paste0("Fold", 1:k)
+  
+  for (i in 1:nrow(hyper_grid)) {
+    print(paste('hyper param: row',i,'/',nrow(hyper_grid)))
+    ntree <- hyper_grid$ntree[i]
+    mtry <- hyper_grid$mtry[i]
+    nodesize <- hyper_grid$nodesize[i]
+    nsplit <- hyper_grid$nsplit[i]
+    
+    for (j in 1:k) {
+      training_set <- training.sample[folds[[j]], ]
+      validation_set <- training.sample[-folds[[j]], ]
+      
+      # make sure that 'training_set' doesn't include the variable 'time_till_event'
+      model <- randomForest(isCase ~ .,
+        data = training_set,
+        ntree = ntree,
+        mtry = mtry,
+        nodesize = nodesize,
+        nsplit = nsplit
+      )
+      
+      predictions <- predict(model, validation_set, type = 'prob') 
+      
+      roc.res = roc(validation_set$isCase, predictions[,'1'])
+      
+      results[i, j] <- roc.res$auc
+    }
+    print(sprintf("ntree=%i, mtry=%i, nodesize=%i, nsplit=%i --> AUC=%.2f", ntree, mtry, nodesize, nsplit, mean(results[i,], na.rm = T)))
+  
+  }
+  
+  # determine the best configuration
+  
+  mean_auc <- rowMeans(results, na.rm = TRUE)
+  
+  hyper_grid$mean_auc <- mean_auc
+  max_auc =  max(hyper_grid$mean_auc)
+  print(max_auc)
+  
+  best_hyperparameters <- hyper_grid[which.max(hyper_grid$mean_auc), ]
+  
+  # "ntree=128, mtry=8, nodesize=2, nsplit=1
+  optimal_ntree <- best_hyperparameters$ntree  # 256 (was 512)
+  optimal_mtry <- best_hyperparameters$mtry # 10
+  optimal_nodesize <- best_hyperparameters$nodesize # 1 (was 2)
+  optimal_nsplit <- best_hyperparameters$nsplit # 1 (was 15) 
+} else {
+
+  # optional: start here without re-tuning hyperparameters: 
+  optimal_ntree = 256; optimal_mtry = 10; optimal_nodesize = 1; optimal_nsplit = 1
+  
+}
+
+
+# 3) train the tuned Random Forest model using the training data
+rf.fit = randomForest(isCase ~ . , data = training, 
+               ntree = optimal_ntree, 
+               mtry = optimal_mtry, 
+               nodesize = optimal_nodesize, 
+               nsplit = optimal_nsplit)
+saveRDS(rf.fit, paste('rf.fit.timeWindow5Y.age_',PRED_AGE,'.RDs',sep=''))
+# rf.fit = readRDS(paste('rf.fit.age_',PRED_AGE,'.RDs',sep=''))
+
+# 4) apply the fitted/trained model on the testing set
+colnames(testing) <- make.names(colnames(testing))
+y.pred <- predict(rf.fit,newdata = testing, type = 'prob')
+
+# Create a confusion matrix
+roc.res = roc(factor(testing$isCase), y.pred[,2])
+summary_stats = getSummaryStatsTbl(roc.res)
+View(summary_stats)
+write.csv(summary_stats, paste('RF_summary_stats_timewindow5Y_age_',PRED_AGE,'.csv',sep=''))
+
+# Get top predictors 
+var_imp = importance(rf.fit)
+top_predictors = sort(var_imp[, "MeanDecreaseGini"], decreasing = T)
+
+top_20_predictors = data.frame(pred = names(head(top_predictors, n = 20)), Gini = head(top_predictors, n = 20))
+  
+dx_idxs = grep('dx_', top_20_predictors$pred)
+labs_idxs = grep('labs_', top_20_predictors$pred)
+meds_idxs = grep('meds_', top_20_predictors$pred)
+  
+dx_dict = readRDS('dx_dict.RDs')
+labs_dict = readRDS('labs_dict.RDs')
+meds_dict = readRDS('meds_dict.RDs')
+top_20_predictors$description = ''
+if (length(dx_idxs) > 0){
+  top_20_predictors$description[dx_idxs] = dx_dict$DIAGNOSIS_NAME[match(gsub('dx_','',top_20_predictors$pred[dx_idxs]), make.names(dx_dict$DIAGNOSIS_CODE))]
+}
+if (length(labs_idxs) > 0){
+  top_20_predictors$description[labs_idxs] = labs_dict$LAB_NAME[match(gsub('labs_','',top_20_predictors$pred[labs_idxs]), make.names(labs_dict$LAB_CODE))]
+}
+if (length(meds_idxs) > 0){
+  top_20_predictors$description[meds_idxs] = meds_dict$MED_NAME[match(gsub('meds_','',top_20_predictors$pred[meds_idxs]), make.names(meds_dict$MED_CODE))]
+}
+rownames(top_20_predictors) = 1:nrow(top_20_predictors)
+View(top_20_predictors)
+write.csv(top_20_predictors, paste('RF_top_predictors_timewindow5Y_age_',PRED_AGE,'.csv',sep=''))
+```
+
+
+```{r featureSelectionRandomForest}
+library(caret)
+library(randomForest)
+
+# Assuming that "target" is the name of your outcome variable
+
+# Define the control method for train() function
+# This will use 5-fold cross-validation and down-sampling to handle class imbalance
+train_control <- trainControl(method="cv", 
+                              number=5, 
+                              verboseIter=TRUE, 
+                              returnData=FALSE, 
+                              returnResamp="all", 
+                              classProbs = TRUE,
+                              sampling = "down",
+                              search = "random",
+                              summaryFunction=twoClassSummary)
+
+# Set up a simple grid of tuning parameters to try
+# Just using mtry (number of variables randomly sampled at each split)
+grid <- expand.grid(.mtry = c(2, 3, 4))
+
+# Fit the model on your data
+# Note: replace `your_data` with your actual data frame, and `target` with your actual target variable
+set.seed(123)
+colnames(training.sample) <- make.names(colnames(training.sample))
+levels(training.sample$isCase) <- c('Control','Case')
+rf_model <- train(isCase ~ ., 
+                  data = training.sample, 
+                  method = "rf", 
+                  metric = "ROC",
+                  tuneGrid = grid, 
+                  trControl = train_control)
+
+# Get feature importance
+importance <- varImp(rf_model, scale = FALSE)
+# Get the names of the top 500 variables
+topvars = rownames(importance$importance)[order(importance$importance, decreasing = T)[1:500]]
+# remove 'cheat codes' 
+topvars = c(topvars[!(topvars %in% 'timeTillEvent')], 'isCase')
+
+# for categorical values - we don't want to include specific values, but the entire variable
+topvars <- sub("^SEX.*", "SEX", topvars)
+topvars <- sub("^MARITAL_STATUS.*", "MARITAL_STATUS", topvars)
+topvars <- sub("^ethnicity.*", "ethnicity", topvars)
+topvars = unique(topvars)
+
+write.csv(topvars, './topvars_rf_model.csv')
+
+# Create a new data frame that only includes the top variables
+new_data.training <- training.sample[, topvars]
+new_data.testing <- testing[, topvars]
+
+# test the model using only top variables
+hyper_grid <- expand.grid(
+  ntree = c(128, 256, 512, 1024),
+  mtry = seq(2, 10, 2),
+  nodesize = seq(1, 5, 1)
+)
+
+
+rf_model <- train(isCase ~ ., 
+                  data = new_data.training, 
+                  method = "rf", 
+                  metric = "ROC",
+                  tuneGrid = hyper_grid, 
+                  trControl = train_control)
+
+y.pred <- predict(rf_model, newdata = new_data.testing, type = 'prob')
+
+
+roc.res = roc(new_data.testing$isCase, y.pred[,2])
+View(getSummaryStatsTbl(roc.res))
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+
+
+# Previous code (before April 2023)
+
+
+for (PRED_AGE in c(20,25,30)) {
+  print(paste('PRED_AGE',PRED_AGE, sep = '='))
+  pred.data.ready = readRDS(paste('pred.data.ready.age_',PRED_AGE,'.RDs',sep=''))
+  pred.data.ready = pred.data.ready[pred.data.ready$timeTillEvent >= 0, ]
+  training_ids = readRDS(paste('training_ids.age_',PRED_AGE,'.RDs',sep=''))
+  training_idxs = which(rownames(pred.data.ready) %in% as.character(training_ids))
+
+  pred.data.ready$isCase = as.integer(pred.data.ready$isCase) - 1
+
+  training = pred.data.ready[training_idxs, ]
+  testing = pred.data.ready[-training_idxs, ]
+
+  rf.fit = rfsrc(Surv(timeTillEvent,isCase)~., data = training, ntree = 128, nodesize = 5, nsplit = 50, importance = TRUE)
+  saveRDS(rf.fit, paste('rf.fit.age_',PRED_AGE,'.RDs',sep=''))
+}
+
+for (PRED_AGE in c(15, 20,25,30)) {
+  print(paste('PRED_AGE',PRED_AGE, sep = '='))
+  pred.data.ready = readRDS(paste('pred.data.ready.age_',PRED_AGE,'.RDs',sep=''))
+  pred.data.ready = pred.data.ready[pred.data.ready$timeTillEvent >= 0, ]
+  pred.data.ready$isCase = as.integer(pred.data.ready$isCase) - 1
+  training_ids = readRDS(paste('training_ids.age_',PRED_AGE,'.RDs',sep=''))
+  training_idxs = which(rownames(pred.data.ready) %in% as.character(training_ids))
+  testing = pred.data.ready[-training_idxs, ]
+  
+  rf.fit = readRDS(paste('rf.fit.age_',PRED_AGE,'.RDs',sep=''))
+  y.pred <- predict(rf.fit,newdata = pred.data.ready)
+  
+  survival_cases = y.pred$survival[which(y.pred$yvar$isCase == 1), ]
+  survival_controls = y.pred$survival[which(y.pred$yvar$isCase == 0), ]
+  
+  survival_cases_mean = apply(survival_cases, 2, mean)
+  survival_cases_sd = apply(survival_cases, 2, sd)
+  survival_controls_mean = apply(survival_controls, 2, mean)
+  survival_controls_sd = apply(survival_controls, 2, sd)
+  
+  plot_data = rbind(data.frame(year = 1:length(survival_cases_mean), survival = survival_cases_mean, std = survival_cases_sd, is_case = TRUE), 
+    data.frame(year = 1:length(survival_controls_mean), survival = survival_controls_mean, std = survival_controls_sd, is_case = FALSE))
+  
+  p <- ggplot(data = plot_data, aes(x = year, y = survival, fill = is_case)) + geom_ribbon(aes(ymin = survival - std, ymax = survival + std, group=is_case), alpha = 0.3) + geom_line(color = "firebrick", size = 1) + theme_minimal() + ggtitle(paste('Pred age = ', PRED_AGE))  
+  print(p)
+}
+```
+
+```{r}
+require(xgboost)
+require(pROC)
+require(ggplot2)
+
+pred.data = readRDS('pred.data.ready.RDs')
+pred.data$isCase = rownames(pred.data) %in% as.character(cases$PATIENT_ID)
+training_ids = readRDS('training_ids.RDs')
+
+getXGboostModelPerformance <- function(xgb_model, testing){
+  xgb.pred =  predict (xgb_model,testing)
+  
+  true_outcome = getinfo(testing, 'label')
+  xgb.roc.res = roc(true_outcome, xgb.pred)
+  return(getSummaryStatsTbl(xgb.roc.res))
+}
+
+#
+# Return the top 'count' significant variables from a XGBoost model
+#
+getBestParams <- function(xgb.fit, count = 50){
+  mat <- xgb.importance(model = xgb.fit)
+  count = min(nrow(mat), count)
+  return(unlist(mat[1:count, 'Feature']))
+}
+
+convertToXGBoostMatrix <- function(df)
+{
+  outcome_col = grep('isCase', colnames(df))
+  for (col in colnames(df)){ if (class(df[, col]) == 'factor') df[, col] <- as.numeric(df[, col]) - 1 }
+  df.xgb = xgb.DMatrix(data = as.matrix(df[,-outcome_col]), label = as.numeric(df$isCase) )
+  return(df.xgb)
+}
+
+buildAndValidateXGBoost <- function(training, testing, params)
+{
+  # convert dataset to XGBoost format
+  training <- convertToXGBoostMatrix(training)
+  testing <- convertToXGBoostMatrix(testing)
+  
+  # find the nrounds parameter (equivalent to number of trees to grows)
+  xgbcv <- xgb.cv( params = params, data = training, nrounds = 100, nfold = 5, showsd = T, stratified = T, print_every_n = 10, early_stopping_rounds = 40, maximize = F)
+  best_nrounds = xgbcv$best_iteration; print(paste('selected nrounds:', best_nrounds))
+  xgb.fit <- xgb.train (params = params, data = training, nrounds = best_nrounds, watchlist = list(train=training, val=testing), print_every_n = 10, early_stopping_rounds = 10, maximize = F , eval_metric = "error") # optional: you can show simultaneous performance over the testing set using: list(val=testing,train=training)
+  
+  # validate performance on the testing set
+  xgb.pred <- predict (xgb.fit,testing)
+  true_outcome = getinfo(testing, 'label')
+  xgb.roc.res = roc(true_outcome, xgb.pred)
+  print(getSummaryStatsTbl(xgb.roc.res)[2, ])
+  
+  return(list(training, testing, xgb.fit, xgb.pred))
+}
+
+# PRED_AGE = NA; FOLLOW_UP = NA
+builModel <- function(pred.data, training_ids, PRED_AGE, FOLLOW_UP)
+{
+    colnames(pred.data) <- make.names(colnames(pred.data))
+    pred.data$ethnicity = factor(as.character(pred.data$ethnicity))
+    training_idxs = which(rownames(pred.data) %in% as.character(training_ids))
+    training <- pred.data[training_idxs, ]
+    testing <- pred.data[-training_idxs, ]
+    
+    params = list(booster = "gbtree", objective = "binary:logistic", eta=0.3, gamma=0, max_depth=6, min_child_weight=1, subsample=1, colsample_bytree=1)
+    
+    xgboost.res = buildAndValidateXGBoost(training, testing, params)
+  
+    return(xgboost.res)
+}
+
+xgboost.res = builModel(pred.data, training_ids, NA, NA) # returns: list(training, testing, xgb.fit, xgb.pred)
+
+getXGboostModelPerformance(xgboost.res[[3]], xgboost.res[[2]])
+
+# Show the different variables contributing to the model
+xgboost.fit = xgboost.res[[3]] 
+mat <- xgb.importance(model = xgboost.fit)
+print(xgb.ggplot.importance(importance_matrix = mat[1:20], rel_to_first = F) + ggtitle("") + theme(legend.position = 'none') + theme_minimal())
+
+
+```
+
+
+<!-- for (PRED_AGE in c(15,20,25,30)){ -->
+<!--   print(paste('------------------------ Age =',PRED_AGE,'------------------------')) -->
+<!--   for (FOLLOW_UP in c(1,3,5)){ -->
+
+<!--     roc.res = roc(testing$isCase, rf.pred[,2]) -->
+<!--     print(paste('AUC=',round(roc.res$auc, digits = 2))) -->
+<!--     print(getSummaryStatsTbl(roc.res)) -->
+<!--   } -->
+<!-- }   -->
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 4. Get models' performance (Table 3)  -------------------------------------------------------------
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+library(randomForest)
+library(pROC)
+
+
+demographics = readRDS('RPDRml_demographics_sample2.RDs')
+all_sujects_ids = demographics$PATIENT_ID
+
+cases = readRDS('./cases_broad_sample2.RDs')
+controls = readRDS('./controls_sample2.RDs')
+# include only true cases and true controls
+included_ids = unique(c(cases$PATIENT_ID, controls$PATIENT_ID))
+
+
+# postfix = 'AllControls' | 'SelectedControls' --> original cohort, including 80% of the data
+# postfix = 'AllControls2' | 'SelectedControls2' --> new cohort including 100% of the data
+
+table3.all_controls <- getModelPerformance2('AllControls2', cases, all_sujects_ids)
+table3.selected_controls <- getModelPerformance2('SelectedControls2', cases, included_ids)
+
+
+table3 = cbind(table3.all_controls, table3.selected_controls)
+View(table3[order(table3$Age, table3$TimeWindow), ])
+
+View(table3.all_controls[order(table3.all_controls$TimeWindow), ])
+View(table3.selected_controls[order(table3.selected_controls$TimeWindow), ])
+
+
+res$AUC <- round(res$AUC, digits = 2)
+View(res)
+write.csv(res, paste('al_models_aucs_',postfix, '.csv') ) # all_ages_stats = read.csv('all_ages_stats.csv')
+
+top_vars = (rownames(imp_vars)[order(imp_vars, decreasing = T)])[1:20]
+
+top_vars_dx = gsub('(dx_)|(0$)','',top_vars[grep('dx_', top_vars)])
+top_vars_dx = gsub('ICD9.', 'ICD9:', top_vars_dx)
+top_vars_dx_desc = dx_dict$concept_name[match(top_vars_dx, dx_dict$concept_code)]
+print(paste(paste(top_vars_dx, top_vars_dx_desc,sep='='), collapse = ', '))
+
+top_vars_procs = gsub('(procs_)|(0$)','',top_vars[grep('procs_', top_vars)])
+top_vars_procs = gsub('CPT4.', 'CPT4:', top_vars_procs)
+top_vars_procs_desc = procs_dict$concept_name[match(top_vars_procs, procs_dict$concept_code)]
+print(paste(paste(top_vars_procs, paste(substr(top_vars_procs_desc,1,200),'...'),sep='='), collapse = ', '))
+print(paste(paste(top_vars_procs_desc, paste('(',top_vars_procs,')',sep=''), collapse = ', ')))
+
+
+
+#
+# Study specific risk-factors
+#
+
+model.data.selected_controls = readRDS('modelDataSelectedPatients2.RDs')
+
+all_ids = unique(model.data.selected_controls$PATIENT_ID)
+cases_ids = unique(model.data.selected_controls$PATIENT_ID[model.data.selected_controls$isCase])
+controls_ids = unique(model.data.selected_controls$PATIENT_ID[!model.data.selected_controls$isCase])
+
+cpt90801 <- model.data.selected_controls[grep('CPT4:90801', model.data.selected_controls$concept_code), ]
+cpt90801 <- cpt90801[is.na(cpt90801$time_till_index) | ( !is.na(is.na(cpt90801$time_till_index)) & cpt90801$time_till_index>0 ), ] # keep all controls and all cases with code before FEP
+ids_CPT90801 <- unique(cpt90801$PATIENT_ID)
+
+showCountandRate(sum(ids_CPT90801 %in% all_ids), length(all_ids))
+showCountandRate(sum(ids_CPT90801 %in% cases_ids), length(cases_ids))
+showCountandRate(sum(ids_CPT90801 %in% controls_ids), length(controls_ids))
+
+
+cpt90801 = cpt90801[order(cpt90801$PATIENT_ID, cpt90801$date), ]
+cpt90801_first = cpt90801[!duplicated(cpt90801$PATIENT_ID), ]
+summary(cpt90801_first$time_till_index[!is.na(cpt90801_first$time_till_index)])
