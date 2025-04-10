@@ -4,7 +4,7 @@ This repository contains the analysis pipeline for predicting first-diagnosis ps
 
 ## Project Overview
 
-This project aims to develop predictive models for identifying individuals at risk of receiving their first diagnosis of psychotic disorders. The analysis includes model development using data from two healthcare systems: Boston Children's Hospital (BCH) and Massachusetts General Hospital (MGH). The analysis is structured in three main steps:
+This project aims to develop predictive models for identifying individuals at risk of receiving their first diagnosis of psychotic disorders. The analysis includes model development using data from two healthcare systems: Boston Children's Hospital (BCH) and Massachusetts General Brigham (MGB). The analysis is structured in three main steps:
 
 1. Data Import and Case Definition
 2. Data Preparation for Modeling
@@ -17,14 +17,14 @@ This project aims to develop predictive models for identifying individuals at ri
 - `Psychosis Step 2 - Prepare data for modelling v2.Rmd`: Feature engineering and data preparation for modeling
 - `Psychosis Step 3 - Run Models v2.Rmd`: Implementation of predictive models and analysis
 
-### `MGH_model_training/`
-- `Psychosis Step 1 - import data.R`: Initial data processing for MGH dataset
+### `MGB_model_training/`
+- `Psychosis Step 1 - import data.R`: Initial data processing for MGB dataset
 - `Psychosis Step 2 - prepare data.R`: Feature engineering and data preparation
 - `Psychosis Step 3 - run analysis.R`: Model implementation and analysis
 - `Train_Without_Race.R`: Additional model training excluding race variables
 
 ### `model_result_analysis/`
-Directory containing model evaluation results and analysis outputs at MGH 
+Directory containing model evaluation results and analysis outputs at MGB
 
 ## Getting Started
 
